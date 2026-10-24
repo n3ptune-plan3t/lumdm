@@ -864,5 +864,4 @@ int main(int argc, char **argv) {
     }
     term_reset();
     return 0;
-    }
 }
