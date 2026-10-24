@@ -146,6 +146,19 @@ static void fit(const char *s, int w, int al) {
 // -------------------------------------------------------------- terminal ----
 static struct termios saved_tio;
 static bool have_tio;
+static char tty_path[PATH_MAX];
+
+// When a session leader exits, the kernel vhangup()s the console: our fd 0/1 go dead.
+// Reopen the tty by path (stderr is left alone: it may be the journal).
+static bool reopen_tty(void) {
+    if (!tty_path[0]) return false;
+    int fd = open(tty_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) return false;
+    dup2(fd, 0);
+    dup2(fd, 1);
+    if (fd > 2) close(fd);
+    return true;
+}
 
 static void palette(void) {
     if (!g.vt) return;
@@ -170,6 +183,7 @@ static void term_init(void) {
     tcsetattr(0, TCSAFLUSH, &t);
     if (g.vt) {
         ioctl(0, KDSETMODE, KD_TEXT);
+        ioctl(0, KDSKBMODE, K_UNICODE);        // undo raw/off mode left by a crashed compositor
         struct vt_mode m = {.mode = VT_AUTO};
         ioctl(0, VT_SETMODE, &m);
         palette();
@@ -676,6 +690,8 @@ static void do_login(void) {
     pam_end(ph, PAM_SUCCESS);
     if (penv) { for (char **e = penv; *e; e++) free(*e); free(penv); }
 
+    reopen_tty();
+    get_size();
     term_init();
     set_msg(false, "");
     g.focus = 2;
@@ -799,6 +815,7 @@ int main(int argc, char **argv) {
 
     const char *term = getenv("TERM");
     const char *tty = ttyname(0);
+    if (tty) snprintf(tty_path, sizeof tty_path, "%s", tty);
     int vtn = 0;
     if (tty && sscanf(tty, "/dev/tty%d", &vtn) == 1 && vtn > 0) g.vtn = vtn;
     g.vt = !g.preview && vtn > 0 && term && !strcmp(term, "linux");
@@ -816,8 +833,9 @@ int main(int argc, char **argv) {
 
     struct sigaction sa = {.sa_handler = on_sig};
     sigemptyset(&sa.sa_mask);
-    const int sigs[] = {SIGTERM, SIGINT, SIGHUP, SIGWINCH};
+    const int sigs[] = {SIGTERM, SIGINT, SIGWINCH};
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, nullptr);
+    signal(SIGHUP, SIG_IGN);       // tty hangups are handled by reopening, not by dying
     signal(SIGTSTP, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
 
@@ -834,11 +852,17 @@ int main(int argc, char **argv) {
             in_n = n > 0 ? (int)n : 0;
             in_p = 0;
             for (int k; (k = next_key());) on_key(k);
-        } else if (r > 0 && (p.revents & (POLLHUP | POLLERR))) {
-            break;
+            if (g.preview && quit_flag) break;
+        } else if (r > 0 && (p.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            struct timespec ts = {0, 200 * 1000 * 1000};   // avoid a busy loop while recovering
+            nanosleep(&ts, nullptr);
+            if (!reopen_tty()) break;
+            get_size();
+            term_init();
         }
         draw();
     }
     term_reset();
     return 0;
+    }
 }
