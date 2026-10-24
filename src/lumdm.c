@@ -33,12 +33,14 @@
 #define CONF "/etc/lumdm.conf"
 #define STATE_DIR "/var/lib/lumdm"
 #define STATE STATE_DIR "/state"
-constexpr int MAX_SESS = 128;
-constexpr int NAME_LEN = 64;
-constexpr int CMD_LEN = 256;
-constexpr int USER_LEN = 64;
-constexpr int PW_LEN = 256;
-constexpr int NFKEY = 12;
+enum {
+    MAX_SESS = 128,
+    NAME_LEN = 64,
+    CMD_LEN = 256,
+    USER_LEN = 64,
+    PW_LEN = 256,
+    NFKEY = 12,
+};
 
 typedef struct { char act[CMD_LEN]; char label[24]; } FKey;
 
