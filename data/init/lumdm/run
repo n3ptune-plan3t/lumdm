@@ -1,0 +1,4 @@
+#!/bin/sh
+chvt 1
+exec </dev/tty1 >/dev/tty1 2>&1
+exec /usr/local/bin/lumdm
