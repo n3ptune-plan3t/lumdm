@@ -70,17 +70,21 @@ static const Glyphs GV = {"┌", "┐", "└", "┘", "─", "│", "«", "»", 
 // ----------------------------------------------------------------- state ----
 static struct {
     Session s[MAX_SESS];
-    int ns, sel, focus, theme, rows, cols, vtn;
+    int ns, sel, focus, theme, rows, cols, vtn, scale;
     char user[USER_LEN], pw[PW_LEN], msg[160], last_sess[NAME_LEN];
     char xserver[128], xinit[128], cfg_user[USER_LEN];
     int numlock;                       // -1 keep, 0 off, 1 on
+    int theme_override_val;            // last theme explicitly chosen by the user
+    bool theme_override;
     FKey fk[NFKEY];
     struct { int theme, numlock; FKey fk[NFKEY]; } base;   // system-level values
     bool err, showpw, vt, preview;
-} g = {.focus = 1, .rows = 24, .cols = 80, .vtn = 1, .numlock = -1,
+} g = {.focus = 1, .rows = 24, .cols = 80, .vtn = 1, .numlock = -1, .scale = 100,
        .xserver = "/usr/bin/X", .xinit = "/usr/bin/xinit"};
 
 static volatile sig_atomic_t quit_flag, winch_flag;
+static char **g_argv;
+static void set_msg(bool err, const char *m);
 
 // ---------------------------------------------------------- output buffer ----
 static char ob[1 << 17];
@@ -231,13 +235,90 @@ static const char *fk_label(const FKey *k) {
     if (k->label[0]) return k->label;
     if (!strcmp(k->act, "poweroff")) return "shutdown";
     if (!strcmp(k->act, "showpw")) return "show password";
+    if (!strcmp(k->act, "scale+")) return "zoom in";
+    if (!strcmp(k->act, "scale-")) return "zoom out";
+    if (!strcmp(k->act, "scale0")) return "zoom reset";
     if (!strncmp(k->act, "exec:", 5)) return "run";
     return k->act;
 }
 
+// -------------------------------------------------------------- wallpaper ----
+// One ASCII night sky (stars + mountains) recoloured from the active theme.
+static int bg_t(int r) {
+    int d = g.rows - 3;
+    int t = (r - 2) * 100 / (d > 0 ? d : 1);
+    return t * t / 100;
+}
+static unsigned bg_row(int r) {
+    const Theme *T = &THEMES[g.theme];
+    return lerp(T->c[R_BG], T->c[R_BG2], bg_t(r));
+}
+static void bg_cell(int r) {
+    if (g.vt) { color(R_BG, true); return; }
+    unsigned c = bg_row(r);
+    put(ESC "[48;2;%u;%u;%um", c >> 16, (c >> 8) & 255, c & 255);
+}
+static unsigned bg_hash(int r, int c) {
+    unsigned h = (unsigned)r * 73856093u ^ (unsigned)c * 19349663u ^ 0x9e3779b9u;
+    h ^= h >> 13;
+    h *= 0x85ebca6bu;
+    h ^= h >> 16;
+    return h;
+}
+static int bg_terrain(int c, const int *peak, const int *ph) {
+    int h = 0;
+    for (int p = 0; p < 3; p++) {
+        int v = ph[p] - abs(c - peak[p]) / 2;
+        if (v > h) h = v;
+    }
+    return h;
+}
+static void draw_wallpaper(void) {
+    if (g.rows < 8 || g.cols < 20) return;
+    for (int r = 2; r < g.rows - 1; r++) {
+        for (int c = 2; c < g.cols; c++) {
+            unsigned h = bg_hash(r, c);
+            if ((h & 255) >= 12) continue;
+            const char *ch = ".";
+            int role = R_DIM;
+            unsigned k = (h >> 8) & 7;
+            if (k == 0) { ch = "*"; role = R_FG; }
+            else if (k < 3) { ch = "+"; role = R_ACCENT; }
+            at(r, c);
+            bg_cell(r);
+            color(role, false);
+            put("%s", ch);
+        }
+    }
+    int hz = g.rows - 2;
+    if (hz < 6) return;
+    int peak[3] = {g.cols / 5, g.cols / 2, g.cols * 4 / 5};
+    int ph[3] = {3 + g.rows / 8, 4 + g.rows / 6, 3 + g.rows / 10};
+    for (int c = 1; c <= g.cols; c++) {
+        int hp = bg_terrain(c - 1, peak, ph);
+        int h = bg_terrain(c, peak, ph), hn = bg_terrain(c + 1, peak, ph);
+        int maxh = hz - 3;
+        if (h > maxh) h = maxh;
+        if (h < 0) h = 0;
+        if (hn > maxh) hn = maxh;
+        if (hn < 0) hn = 0;
+        for (int y = hz - h + 1; h > 0 && y <= hz; y++) {
+            at(y, c);
+            bg_cell(y);
+            if (y == hz - h + 1) {
+                color(R_ACCENT, false);
+                char rc = h > hp && h > hn ? '^' : hn > h ? '/' : hn < h ? '\\' : '^';
+                put("%c", rc);
+            } else {
+                color(R_DIM, false);
+                put("#");
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ draw ----
 static void draw(void) {
-    const Theme *T = &THEMES[g.theme];
     const Glyphs *G = g.vt ? &GV : &GT;
     char host[64] = "localhost", bat[48], when[96];
     gethostname(host, sizeof host - 1);
@@ -252,18 +333,19 @@ static void draw(void) {
     static const char *dither[] = {" ", "░", "▒", "▓"};
     for (int r = 2; r < g.rows; r++) {
         at(r, 1);
-        int t = (r - 2) * 100 / (g.rows - 3 > 0 ? g.rows - 3 : 1);
-        t = t * t / 100;
+        int t = bg_t(r);
         if (g.vt) {
             color(R_BG, true);
             color(R_BG2, false);
             rep(dither[t < 45 ? 0 : t < 65 ? 1 : t < 85 ? 2 : 3], g.cols);
         } else {
-            unsigned c = lerp(T->c[R_BG], T->c[R_BG2], t);
+            unsigned c = bg_row(r);
             put(ESC "[48;2;%u;%u;%um", c >> 16, (c >> 8) & 255, c & 255);
             spaces(g.cols);
         }
     }
+    draw_wallpaper();
+    flush();
     // Top bar.
     at(1, 1);
     color(R_PANEL, true);
@@ -296,9 +378,15 @@ static void draw(void) {
         used += w;
     }
 
-    // Panel.
-    int W = g.cols - 4 < 50 ? g.cols - 4 : 50, H_ = 12;
+    // Panel. g.scale zoom is applied to both dimensions and spacing.
+    int W = 50 * g.scale / 100;
+    if (W > g.cols - 4) W = g.cols - 4;
     if (W < 24) W = g.cols;
+    int H_ = 12 * g.scale / 100;
+    int maxH = g.rows - 3;
+    if (maxH < 9) maxH = g.rows > 2 ? g.rows : 2;
+    if (H_ > maxH) H_ = maxH;
+    if (H_ < 9 && maxH >= 9) H_ = 9;
     int y0 = (g.rows - H_) / 2 + 1, x0 = (g.cols - W) / 2 + 1;
     if (y0 < 2) y0 = 2;
     for (int i = 0; i < H_; i++) {
@@ -309,14 +397,17 @@ static void draw(void) {
         else if (i == H_ - 1) { put("%s", G->bl); rep(G->h, W - 2); put("%s", G->br); }
         else { put("%s", G->v); spaces(W - 2); put("%s", G->v); }
     }
-    int iw = W - 4;
-    at(y0 + 2, x0 + 2);
+    int padx = W / 25 < 2 ? 2 : W / 25;
+    int iw = W - 2 * padx;
+    int titleY = y0 + 2 * H_ / 12, dateY = titleY + 1;
+    int fieldY = y0 + 5 * H_ / 12, msgY = y0 + 9 * H_ / 12;
+    at(titleY, x0 + padx);
     color(R_PANEL, true);
     color(R_FG, false);
     if (!g.vt) put(ESC "[1m");
     fit("Welcome back", iw, 0);
     put(ESC "[22m");
-    at(y0 + 3, x0 + 2);
+    at(dateY, x0 + padx);
     color(R_DIM, false);
     fit(when, iw, 0);
 
@@ -325,8 +416,8 @@ static void draw(void) {
     int vw = iw - 12, curcol = 0;
     for (int k = 0; k < 3; k++) {
         bool f = g.focus == k;
-        int y = y0 + 5 + k;
-        at(y, x0 + 2);
+        int y = fieldY + k;
+        at(y, x0 + padx);
         color(R_FIELD, true);
         color(f ? R_ACCENT : R_FIELD, false);
         put("%s ", G->bar);
@@ -334,7 +425,7 @@ static void draw(void) {
         fit(lab[k], 9, -1);
         color(R_FG, false);
         if (k == 0) {
-            fit(g.s[g.sel].name, vw - 5, -1);
+            fit(g.s[g.sel].name, vw - 5 < 0 ? 0 : vw - 5, -1);
             color(R_DIM, false);
             put(" %s %s ", G->l, G->r);
         } else if (k == 1) {
@@ -343,14 +434,14 @@ static void draw(void) {
             int n = u8len(g.pw);
             if (g.showpw) fit(g.pw, vw, -1);
             else { int d = n < vw ? n : vw; rep(G->dot, d); spaces(vw - d); }
-            if (f) curcol = x0 + 2 + 11 + (n < vw - 1 ? n : vw - 1);
+            if (f) curcol = x0 + padx + 11 + (n < vw - 1 ? n : vw - 1);
         }
         put(" ");
     }
-    if (g.focus == 1) curcol = x0 + 2 + 11 + (u8len(g.user) < vw - 1 ? u8len(g.user) : vw - 1);
+    if (g.focus == 1) curcol = x0 + padx + 11 + (u8len(g.user) < vw - 1 ? u8len(g.user) : vw - 1);
 
     // Message line.
-    at(y0 + 9, x0 + 2);
+    at(msgY, x0 + padx);
     color(R_PANEL, true);
     const char *m = g.msg;
     bool e = g.err;
@@ -358,7 +449,7 @@ static void draw(void) {
     color(e ? R_ERR : R_DIM, false);
     fit(m, iw, 0);
 
-    if (g.focus > 0) { at(y0 + 5 + g.focus, curcol); color(R_FIELD, true); color(R_FG, false); put(ESC "[?25h"); }
+    if (g.focus > 0) { at(fieldY + g.focus, curcol); color(R_FIELD, true); color(R_FG, false); put(ESC "[?25h"); }
     flush();
 }
 
@@ -367,12 +458,14 @@ static void trim(char *s) {
     char *e = s + strlen(s);
     while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
 }
-static void set_theme(const char *n) {
-    for (int i = 0; i < NTHEMES; i++) if (!strcmp(THEMES[i].name, n)) { g.theme = i; return; }
+static bool set_theme(const char *n) {
+    for (int i = 0; i < NTHEMES; i++) if (!strcmp(THEMES[i].name, n)) { g.theme = i; return true; }
+    return false;
 }
 enum { CFG_SYSTEM, CFG_USER, CFG_STATE };
 static bool is_builtin(const char *a) {
-    static const char *b[] = {"none", "poweroff", "reboot", "suspend", "hibernate", "theme", "showpw"};
+    static const char *b[] = {"none", "poweroff", "reboot", "suspend", "hibernate", "theme", "showpw",
+                              "reload", "restart", "stop", "scale+", "scale-", "scale0"};
     for (size_t i = 0; i < sizeof b / sizeof *b; i++) if (!strcmp(a, b[i])) return true;
     return false;
 }
@@ -394,6 +487,16 @@ static void parse_stream(FILE *f, int mode) {
         if (mode == CFG_STATE) {
             if (!strcmp(k, "user")) snprintf(g.user, sizeof g.user, "%s", v);
             else if (!strcmp(k, "session")) snprintf(g.last_sess, sizeof g.last_sess, "%s", v);
+            else if (!strcmp(k, "theme")) {
+                if (set_theme(v)) {
+                    g.theme_override = true;
+                    g.theme_override_val = g.theme;
+                }
+            } else if (!strcmp(k, "scale")) {
+                char *end;
+                long n = strtol(v, &end, 10);
+                if (end != v) g.scale = n < 60 ? 60 : n > 160 ? 160 : (int)n;
+            }
         } else if (!strcmp(k, "theme")) set_theme(v);
         else if (!strcmp(k, "numlock")) g.numlock = !strcmp(v, "on") ? 1 : !strcmp(v, "off") ? 0 : -1;
         else if (mode == CFG_SYSTEM && !strcmp(k, "xserver")) snprintf(g.xserver, sizeof g.xserver, "%s", v);
@@ -435,11 +538,8 @@ static void load_user_conf(const char *user) {
     parse_stream(f, CFG_USER);
     fclose(f);
 }
-static void defaults(void) {
-    static const char *d[] = {"poweroff", "reboot", "suspend", "theme", "showpw"};
-    for (int i = 0; i < 5; i++) snprintf(g.fk[i].act, sizeof g.fk[i].act, "%s", d[i]);
-}
-// Re-layer: defaults < /etc/lumdm.conf < ~/.config/lumdm.conf of the selected user.
+// Re-layer: /etc/lumdm.conf < ~/.config/lumdm.conf of the selected user.
+// A theme chosen at runtime (or restored from state) wins over both.
 static void refresh_user_conf(void) {
     if (!strcmp(g.user, g.cfg_user)) return;
     snprintf(g.cfg_user, sizeof g.cfg_user, "%s", g.user);
@@ -447,6 +547,7 @@ static void refresh_user_conf(void) {
     g.numlock = g.base.numlock;
     memcpy(g.fk, g.base.fk, sizeof g.fk);
     if (g.user[0]) load_user_conf(g.user);
+    if (g.theme_override) g.theme = g.theme_override_val;
     palette();
     apply_numlock();
 }
@@ -455,7 +556,8 @@ static void save_state(void) {
     mkdir(STATE_DIR, 0755);
     FILE *f = fopen(STATE, "w");
     if (!f) return;
-    fprintf(f, "user=%s\nsession=%s\n", g.user, g.s[g.sel].name);
+    fprintf(f, "user=%s\nsession=%s\nscale=%d\n", g.user, g.s[g.sel].name, g.scale);
+    if (g.theme_override) fprintf(f, "theme=%s\n", THEMES[g.theme_override_val].name);
     fclose(f);
 }
 static void clean_exec(char *dst, const char *src) {
@@ -518,6 +620,31 @@ static void load_sessions(void) {
     snprintf(sh.id, sizeof sh.id, "shell");
     snprintf(sh.name, sizeof sh.name, "Shell (tty)");
     g.s[g.ns++] = sh;
+}
+// Re-read /etc/lumdm.conf and the selected user's overrides without dropping input.
+static void reload_config(void) {
+    char sel[NAME_LEN] = "";
+    if (g.ns > 0 && g.sel >= 0 && g.sel < g.ns) snprintf(sel, sizeof sel, "%s", g.s[g.sel].name);
+
+    memset(g.fk, 0, sizeof g.fk);
+    g.theme = 0;
+    g.numlock = -1;
+    snprintf(g.xserver, sizeof g.xserver, "/usr/bin/X");
+    snprintf(g.xinit, sizeof g.xinit, "/usr/bin/xinit");
+    load_kv(CONF, CFG_SYSTEM);
+    g.base.theme = g.theme;
+    g.base.numlock = g.numlock;
+    memcpy(g.base.fk, g.fk, sizeof g.fk);
+
+    g.ns = 0;
+    load_sessions();
+    g.sel = 0;
+    if (sel[0]) for (int i = 0; i < g.ns; i++) if (!strcmp(g.s[i].name, sel)) { g.sel = i; break; }
+    g.cfg_user[0] = 0;
+    refresh_user_conf();
+    palette();
+    apply_numlock();
+    set_msg(false, "configuration reloaded");
 }
 
 // ------------------------------------------------------------------- PAM ----
@@ -728,17 +855,81 @@ static void run_cmd(const char *cmd) {
     if (p > 0) waitpid(p, nullptr, 0);
     set_msg(false, "");
 }
+static void scale_step(int d) {
+    int v = g.scale + d;
+    if (v < 60) v = 60;
+    if (v > 160) v = 160;
+    if (v == g.scale) return;
+    g.scale = v;
+    save_state();
+    char m[32];
+    snprintf(m, sizeof m, "ui scale %d%%", g.scale);
+    set_msg(false, m);
+}
+static void scale_reset(void) {
+    if (g.scale == 100) return;
+    g.scale = 100;
+    save_state();
+    set_msg(false, "ui scale 100%");
+}
+// Ask the init system to reload/restart/stop the lumdm service. Returns false when
+// there is no service manager we recognise, so callers can fall back to local action.
+static bool service_ctl(const char *verb) {
+    set_msg(false, "please wait...");
+    draw();
+    pid_t p = fork();
+    if (p == 0) {
+        if (access("/run/systemd/system", F_OK) == 0)
+            execlp("systemctl", "systemctl", verb, "lumdm", (char *)nullptr);
+        else if (access("/run/runit/service/lumdm", F_OK) == 0)
+            execlp("sv", "sv", verb, "/run/runit/service/lumdm", (char *)nullptr);
+        else if (access("/var/service/lumdm", F_OK) == 0)
+            execlp("sv", "sv", verb, "/var/service/lumdm", (char *)nullptr);
+        else if (access("/etc/sv/lumdm", F_OK) == 0)
+            execlp("sv", "sv", verb, "/etc/sv/lumdm", (char *)nullptr);
+        _exit(1);
+    }
+    int st = 0;
+    if (p > 0)
+        while (waitpid(p, &st, 0) < 0 && errno == EINTR)
+            if (quit_flag) return true;
+    set_msg(false, "");
+    return p > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+static void restart_self(void) {
+    term_reset();
+    if (g_argv && g_argv[0]) execv("/proc/self/exe", g_argv);
+    if (g_argv && g_argv[0]) execv(g_argv[0], g_argv);
+    get_size();
+    term_init();
+    set_msg(true, "restart failed");
+}
 static void run_action(const char *a) {
     if (!*a || !strcmp(a, "none")) return;
-    if (!strcmp(a, "theme")) { g.theme = (g.theme + 1) % NTHEMES; palette(); }
-    else if (!strcmp(a, "showpw")) g.showpw = !g.showpw;
+    if (!strcmp(a, "theme")) {
+        g.theme = (g.theme + 1) % NTHEMES;
+        g.theme_override = true;
+        g.theme_override_val = g.theme;
+        save_state();
+        palette();
+    } else if (!strcmp(a, "showpw")) g.showpw = !g.showpw;
+    else if (!strcmp(a, "reload")) reload_config();
+    else if (!strcmp(a, "restart")) {
+        if (service_ctl("restart")) quit_flag = 1;
+        else restart_self();
+    } else if (!strcmp(a, "stop")) {
+        service_ctl("stop");
+        quit_flag = 1;
+    } else if (!strcmp(a, "scale+")) scale_step(10);
+    else if (!strcmp(a, "scale-")) scale_step(-10);
+    else if (!strcmp(a, "scale0")) scale_reset();
     else if (!strncmp(a, "exec:", 5)) run_cmd(a + 5);       // only ever loaded from /etc/lumdm.conf
     else power(a);                                          // poweroff | reboot | suspend | hibernate
 }
 
 // ----------------------------------------------------------------- input ----
 enum { KEY_UP = 1000, KEY_DOWN, KEY_RIGHT, KEY_LEFT, KEY_DEL, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5,
-       KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12 };
+       KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, KEY_PPAGE, KEY_NPAGE };
 static unsigned char ib[64];
 static int in_n, in_p;
 
@@ -765,6 +956,8 @@ static int next_key(void) {
         while (in_p < in_n && ib[in_p] != '~' && !isalpha(ib[in_p])) in_p++;
         if (in_p < in_n) in_p++;
         if (n == 3) return KEY_DEL;
+        if (n == 5) return KEY_PPAGE;
+        if (n == 6) return KEY_NPAGE;
         if (n >= 11 && n <= 15) return KEY_F1 + (n - 11);      // F1-F5
         if (n >= 17 && n <= 21) return KEY_F6 + (n - 17);      // F6-F10
         if (n == 23 || n == 24) return KEY_F11 + (n - 23);     // F11-F12
@@ -797,6 +990,11 @@ static void on_key(int k) {
     case KEY_UP: g.focus = (g.focus + 2) % 3; break;
     case KEY_RIGHT: cycle_session(1); break;
     case KEY_LEFT: cycle_session(-1); break;
+    case KEY_PPAGE: scale_step(10); break;
+    case KEY_NPAGE: scale_step(-10); break;
+    case '+': case '=': if (field) add(field, cap, k); else scale_step(10); break;
+    case '-': case '_': if (field) add(field, cap, k); else scale_step(-10); break;
+    case '0': if (field) add(field, cap, k); else scale_reset(); break;
     case 127: case 8: if (field) bs(field); break;
     case 0x03: case 0x1b: if (g.preview) quit_flag = 1; break;   // preview: Esc / Ctrl-C quits
     case 0x15: if (field) field[0] = 0; break;                    // Ctrl-U
@@ -809,6 +1007,7 @@ static void on_key(int k) {
 static void on_sig(int s) { if (s == SIGWINCH) winch_flag = 1; else quit_flag = 1; }
 
 int main(int argc, char **argv) {
+    g_argv = argv;
     g.preview = argc > 1 && !strcmp(argv[1], "--preview");
     if (!g.preview && geteuid() != 0) { fputs("lumdm: must run as root (or use --preview)\n", stderr); return 1; }
     if (!isatty(0) || !isatty(1)) { fputs("lumdm: stdin/stdout must be a terminal\n", stderr); return 1; }
@@ -820,7 +1019,6 @@ int main(int argc, char **argv) {
     if (tty && sscanf(tty, "/dev/tty%d", &vtn) == 1 && vtn > 0) g.vtn = vtn;
     g.vt = !g.preview && vtn > 0 && term && !strcmp(term, "linux");
 
-    defaults();
     load_kv(CONF, CFG_SYSTEM);
     g.base.theme = g.theme;
     g.base.numlock = g.numlock;

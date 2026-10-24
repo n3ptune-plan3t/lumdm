@@ -1,0 +1,11 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { cc: [gcc, clang] }
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - run: make CC=${{ matrix.cc }} STD=c2x CFLAGS="-O2 -Werror=implicit-function-declaration"
