@@ -1,8 +1,11 @@
 // lumdm - a tiny, pretty, TTY-based display manager for X11 and Wayland sessions.
-// Language: C23 (ISO/IEC 9899:2024).  Only dependency: libpam.
+// Language: C23 (ISO/IEC 9899:2024).  Only dependency: libpam (+ libm).
+// Optional: system TrueType/OpenType fonts on the Linux console (src/vtfont.h, stb_truetype),
+// ASCII wallpapers (src/scenes.h).
 // Config: /etc/lumdm.conf (system) then ~/.config/lumdm.conf (per-user, restricted).
-// Build: cc -std=c23 -O2 -s -o lumdm lumdm.c -lpam      (GCC 13: use -std=c2x)
-// Try the UI without root/PAM:  ./lumdm --preview
+// Build: cc -std=c23 -O2 -s -o lumdm lumdm.c -lpam -lm  (GCC 13: use -std=c2x)
+// Try the UI without root/PAM:  ./lumdm --preview     Check your config:  ./lumdm --check [user]
+// Preview a font:  ./lumdm --font-test [name|path] [px]
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
@@ -10,6 +13,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <math.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <poll.h>
@@ -42,7 +46,7 @@ enum {
     NFKEY = 12,
 };
 
-typedef struct { char act[CMD_LEN]; char label[24]; } FKey;
+typedef struct { char act[CMD_LEN]; char label[24]; unsigned char src; } FKey;   // src: 0 default, 1 system, 2 user
 
 typedef enum { K_X11, K_WAYLAND, K_SHELL } Kind;
 typedef struct {
@@ -77,16 +81,21 @@ static struct {
     char xserver[128], xinit[128], cfg_user[USER_LEN];
     int numlock;                       // -1 keep, 0 off, 1 on
     int theme_override_val;            // last theme explicitly chosen by the user
-    bool theme_override;
+    int wp, wp_override_val;           // wallpaper (WP_*), and the last one picked with the F-key
+    bool theme_override, wp_override;
     FKey fk[NFKEY];
-    struct { int theme, numlock; FKey fk[NFKEY]; } base;   // system-level values
-    bool err, showpw, vt, preview;
+    struct { int theme, numlock, wp; FKey fk[NFKEY]; } base;   // system-level values
+    bool err, showpw, vt, preview, check;
+    bool dirty;                        // background + bars need a full redraw (the panel is redrawn every key)
 } g = {.focus = 1, .rows = 24, .cols = 80, .vtn = 1, .numlock = -1, .scale = 100,
        .xserver = "/usr/bin/X", .xinit = "/usr/bin/xinit"};
 
 static volatile sig_atomic_t quit_flag, winch_flag;
 static char **g_argv;
 static void set_msg(bool err, const char *m);
+static void get_size(void);
+
+#include "vtfont.h"
 
 // ---------------------------------------------------------- output buffer ----
 static char ob[1 << 17];
@@ -167,6 +176,7 @@ static bool reopen_tty(void) {
 }
 
 static void palette(void) {
+    g.dirty = true;                    // theme colours changed: repaint the scene
     if (!g.vt) return;
     for (int i = 0; i < 16; i++) put(ESC "]P%X%06X", i, THEMES[g.theme].c[i & 7]);
 }
@@ -194,11 +204,15 @@ static void term_init(void) {
         ioctl(0, VT_SETMODE, &m);
         palette();
         apply_numlock();
+        font_apply(g.scale);
     }
     put(ESC "[?25l");
     flush();
+    get_size();
+    g.dirty = true;
 }
 static void term_reset(void) {
+    if (g.vt) font_restore();           // a tty shell gets the normal console font back
     if (have_tio) tcsetattr(0, TCSAFLUSH, &saved_tio);
     put(ESC "[0m" ESC "[2J" ESC "[H" ESC "[?25h");
     if (g.vt) put(ESC "]R");
@@ -234,18 +248,27 @@ static void battery(char *out, size_t n) {
 }
 
 static const char *fk_label(const FKey *k) {
+    static char buf[CMD_LEN];
     if (k->label[0]) return k->label;
     if (!strcmp(k->act, "poweroff")) return "shutdown";
     if (!strcmp(k->act, "showpw")) return "show password";
     if (!strcmp(k->act, "scale+")) return "zoom in";
     if (!strcmp(k->act, "scale-")) return "zoom out";
     if (!strcmp(k->act, "scale0")) return "zoom reset";
-    if (!strncmp(k->act, "exec:", 5)) return "run";
+    if (!strncmp(k->act, "exec:", 5)) {            // show the program name, not just "run"
+        const char *c = k->act + 5;
+        while (*c == ' ') c++;
+        size_t n = strcspn(c, " \t");
+        const char *base = c;
+        for (const char *q = c; q < c + n; q++) if (*q == '/') base = q + 1;
+        snprintf(buf, sizeof buf, "%.*s", (int)(c + n - base), base);
+        return buf[0] ? buf : "run";
+    }
     return k->act;
 }
 
 // -------------------------------------------------------------- wallpaper ----
-// One ASCII night sky (stars + mountains) recoloured from the active theme.
+// Theme-based background; the scenes themselves live in scenes.h.
 static int bg_t(int r) {
     int d = g.rows - 3;
     int t = (r - 2) * 100 / (d > 0 ? d : 1);
@@ -267,69 +290,43 @@ static unsigned bg_hash(int r, int c) {
     h ^= h >> 16;
     return h;
 }
-static int bg_terrain(int c, const int *peak, const int *ph) {
-    int h = 0;
-    for (int p = 0; p < 3; p++) {
-        int v = ph[p] - abs(c - peak[p]) / 2;
-        if (v > h) h = v;
-    }
-    return h;
+// Geometry of the login panel (zoom applies to it, unless a real font size does the zooming).
+static struct { int y0, x0, w, h; } pg;
+static void panel_geom(void) {
+    int sc = font_active() ? 100 : g.scale;
+    int W = 50 * sc / 100;
+    if (W > g.cols - 4) W = g.cols - 4;
+    if (W < 24) W = g.cols;
+    int H_ = 12 * sc / 100, maxH = g.rows - 3;
+    if (maxH < 9) maxH = g.rows > 2 ? g.rows : 2;
+    if (H_ > maxH) H_ = maxH;
+    if (H_ < 9 && maxH >= 9) H_ = 9;
+    int y0 = (g.rows - H_) / 2 + 1;
+    if (y0 < 2) y0 = 2;
+    pg.y0 = y0; pg.x0 = (g.cols - W) / 2 + 1; pg.w = W; pg.h = H_;
 }
-static void draw_wallpaper(void) {
-    if (g.rows < 8 || g.cols < 20) return;
-    for (int r = 2; r < g.rows - 1; r++) {
-        for (int c = 2; c < g.cols; c++) {
-            unsigned h = bg_hash(r, c);
-            if ((h & 255) >= 12) continue;
-            const char *ch = ".";
-            int role = R_DIM;
-            unsigned k = (h >> 8) & 7;
-            if (k == 0) { ch = "*"; role = R_FG; }
-            else if (k < 3) { ch = "+"; role = R_ACCENT; }
-            at(r, c);
-            bg_cell(r);
-            color(role, false);
-            put("%s", ch);
-        }
-    }
-    int hz = g.rows - 2;
-    if (hz < 6) return;
-    int peak[3] = {g.cols / 5, g.cols / 2, g.cols * 4 / 5};
-    int ph[3] = {3 + g.rows / 8, 4 + g.rows / 6, 3 + g.rows / 10};
-    for (int c = 1; c <= g.cols; c++) {
-        int hp = bg_terrain(c - 1, peak, ph);
-        int h = bg_terrain(c, peak, ph), hn = bg_terrain(c + 1, peak, ph);
-        int maxh = hz - 3;
-        if (h > maxh) h = maxh;
-        if (h < 0) h = 0;
-        if (hn > maxh) hn = maxh;
-        if (hn < 0) hn = 0;
-        for (int y = hz - h + 1; h > 0 && y <= hz; y++) {
-            at(y, c);
-            bg_cell(y);
-            if (y == hz - h + 1) {
-                color(R_ACCENT, false);
-                char rc = h > hp && h > hn ? '^' : hn > h ? '/' : hn < h ? '\\' : '^';
-                put("%c", rc);
-            } else {
-                color(R_DIM, false);
-                put("#");
-            }
-        }
-    }
-}
+#include "scenes.h"
 
 // ------------------------------------------------------------------ draw ----
-static void draw(void) {
-    const Glyphs *G = g.vt ? &GV : &GT;
-    char host[64] = "localhost", bat[48], when[96];
+static const char *fk_short(const FKey *k) {
+    if (k->label[0]) return k->label;
+    static const struct { const char *a, *s; } m[] = {{"poweroff", "off"}, {"reboot", "reboot"}, {"suspend", "sleep"},
+        {"hibernate", "hibernate"}, {"theme", "theme"}, {"showpw", "pw"}, {"reload", "reload"}, {"restart", "restart"},
+        {"stop", "stop"}, {"scale+", "zoom+"}, {"scale-", "zoom-"}, {"scale0", "zoom0"}, {"wallpaper", "wall"}};
+    for (size_t i = 0; i < sizeof m / sizeof *m; i++) if (!strcmp(k->act, m[i].a)) return m[i].s;
+    return fk_label(k);
+}
+static bool fk_on(const FKey *k) { return k->act[0] && strcmp(k->act, "none"); }
+static int fk_w(int i, int pass) {
+    const FKey *k = &g.fk[i];
+    return (i < 9 ? 2 : 3) + 1 + u8len(pass ? fk_short(k) : fk_label(k)) + (pass ? 2 : 3);
+}
+
+static void draw_scene(void) {
+    const Glyphs *G = g.vt && !font_active() ? &GV : &GT;
+    char host[64] = "localhost", bat[48];
     gethostname(host, sizeof host - 1);
     battery(bat, sizeof bat);
-    time_t now = time(nullptr);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    strftime(when, sizeof when, "%A, %d %B  \xc2\xb7  %H:%M", &tm);
-
     put(ESC "[?25l" ESC "[0m");
     // Background: smooth gradient (truecolor) or dithered blocks (VT).
     static const char *dither[] = {" ", "░", "▒", "▓"};
@@ -346,7 +343,8 @@ static void draw(void) {
             spaces(g.cols);
         }
     }
-    draw_wallpaper();
+    build_wallpaper();
+    emit_wallpaper();
     flush();
     // Top bar.
     at(1, 1);
@@ -359,38 +357,47 @@ static void draw(void) {
     put("%.*s", g.cols / 2, host);
     int bl = u8len(bat);
     if (bl && g.cols > bl + 4) { at(1, g.cols - bl); color(R_DIM, false); put("%s", bat); }
-    // Bottom bar with key hints.
+    // Bottom bar: full labels if they fit, else short ones, else as many keys as fit.
     at(g.rows, 1);
     color(R_PANEL, true);
     spaces(g.cols);
     at(g.rows, 2);
+    int pass = 0;
+    for (; pass < 2; pass++) {
+        int total = 1;
+        for (int i = 0; i < NFKEY; i++) if (fk_on(&g.fk[i])) total += fk_w(i, pass);
+        if (total <= g.cols) break;
+    }
+    bool trunc = pass == 2;
+    if (trunc) pass = 1;
     int used = 1;
     for (int i = 0; i < NFKEY; i++) {
         const FKey *k = &g.fk[i];
-        if (!k->act[0] || !strcmp(k->act, "none")) continue;
+        if (!fk_on(k)) continue;
+        if (used + fk_w(i, pass) > g.cols - (trunc ? 4 : 0)) {
+            if (trunc) { color(R_DIM, false); put("..."); }
+            break;
+        }
         char kn[8];
         snprintf(kn, sizeof kn, "F%d", i + 1);
-        const char *lb = fk_label(k);
-        int w = (int)strlen(kn) + 1 + u8len(lb) + 3;
-        if (used + w > g.cols) break;
         color(R_ACCENT, false);
         put("%s", kn);
         color(R_DIM, false);
-        put(" %s   ", lb);
-        used += w;
+        put(pass ? " %s  " : " %s   ", pass ? fk_short(k) : fk_label(k));
+        used += fk_w(i, pass);
     }
+    flush();
+}
 
-    // Panel. g.scale zoom is applied to both dimensions and spacing.
-    int W = 50 * g.scale / 100;
-    if (W > g.cols - 4) W = g.cols - 4;
-    if (W < 24) W = g.cols;
-    int H_ = 12 * g.scale / 100;
-    int maxH = g.rows - 3;
-    if (maxH < 9) maxH = g.rows > 2 ? g.rows : 2;
-    if (H_ > maxH) H_ = maxH;
-    if (H_ < 9 && maxH >= 9) H_ = 9;
-    int y0 = (g.rows - H_) / 2 + 1, x0 = (g.cols - W) / 2 + 1;
-    if (y0 < 2) y0 = 2;
+static void draw_panel(void) {
+    const Glyphs *G = g.vt && !font_active() ? &GV : &GT;
+    char when[96];
+    time_t now = time(nullptr);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(when, sizeof when, "%A, %d %B  \xc2\xb7  %H:%M", &tm);
+    put(ESC "[?25l" ESC "[0m");
+    int W = pg.w, H_ = pg.h, y0 = pg.y0, x0 = pg.x0;
     for (int i = 0; i < H_; i++) {
         at(y0 + i, x0);
         color(R_PANEL, true);
@@ -455,6 +462,13 @@ static void draw(void) {
     flush();
 }
 
+
+static void draw(void) {
+    panel_geom();
+    if (g.dirty) { g.dirty = false; draw_scene(); }
+    draw_panel();
+}
+
 // ------------------------------------------------------- config & session ----
 static void trim(char *s) {
     char *e = s + strlen(s);
@@ -464,92 +478,184 @@ static bool set_theme(const char *n) {
     for (int i = 0; i < NTHEMES; i++) if (!strcmp(THEMES[i].name, n)) { g.theme = i; return true; }
     return false;
 }
+static bool set_wallpaper(const char *n) {
+    if (!strcmp(n, "random")) { g.wp = (int)((unsigned)time(nullptr) / 7 % 3); return true; }
+    for (int i = 0; i < NWP; i++) if (!strcmp(WP_NAMES[i], n)) { g.wp = i; return true; }
+    return false;
+}
 enum { CFG_SYSTEM, CFG_USER, CFG_STATE };
 static bool is_builtin(const char *a) {
-    static const char *b[] = {"none", "poweroff", "reboot", "suspend", "hibernate", "theme", "showpw",
+    static const char *b[] = {"none", "poweroff", "reboot", "suspend", "hibernate", "theme", "showpw", "wallpaper",
                               "reload", "restart", "stop", "scale+", "scale-", "scale0"};
     for (size_t i = 0; i < sizeof b / sizeof *b; i++) if (!strcmp(a, b[i])) return true;
     return false;
 }
-// System file: everything, incl. exec:<cmd> (runs as root - file is root-owned).
-// User file: theme, numlock, fN, fN_label - built-in actions only, never exec:.
-static void parse_stream(FILE *f, int mode) {
+// Case-insensitive, with a few friendly aliases. exec:<cmd> is left alone.
+static const char *canon_action(char *v) {
+    if (!strncmp(v, "exec:", 5)) return v;
+    for (char *c = v; *c; c++) *c = (char)tolower((unsigned char)*c);
+    if (!strcmp(v, "shutdown") || !strcmp(v, "halt")) return "poweroff";
+    if (!strcmp(v, "sleep")) return "suspend";
+    if (!strcmp(v, "zoom+") || !strcmp(v, "zoomin")) return "scale+";
+    if (!strcmp(v, "zoom-") || !strcmp(v, "zoomout")) return "scale-";
+    return v;
+}
+static const char *cfg_file;
+static int cfg_line;
+static void diag(const char *fmt, ...) {          // --check only: say why a line was not used
+    if (!g.check) return;
+    va_list a;
+    va_start(a, fmt);
+    printf("  ignored  %s:%d: ", cfg_file, cfg_line);
+    vprintf(fmt, a);
+    putchar('\n');
+    va_end(a);
+}
+// System file: everything, incl. exec:<cmd> (runs as root - file is root-owned) and font settings.
+// User file: theme, wallpaper, numlock, fN, fN_label - built-in actions only, never exec:.
+// Keys are case-insensitive; "key = value  # comment" (blank before '#') is allowed.
+static void parse_stream(FILE *f, int mode, const char *name) {
     char l[CMD_LEN + 64];
+    cfg_file = name;
+    cfg_line = 0;
     while (fgets(l, sizeof l, f)) {
+        cfg_line++;
         trim(l);
         char *p = l;
         while (isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '#') continue;
         char *eq = strchr(p, '=');
-        if (*p == '#' || !eq) continue;
+        if (!eq) { diag("no '=' in \"%s\"", p); continue; }
         *eq = 0;
         char *k = p, *v = eq + 1;
         trim(k);
+        for (char *q = k; *q; q++) *q = (char)tolower((unsigned char)*q);
         while (isspace((unsigned char)*v)) v++;
-        if (strncmp(v, "exec:", 5)) { char *c = strstr(v, " #"); if (c) *c = 0; trim(v); }
+        if (strncmp(v, "exec:", 5)) {
+            for (char *c = v; *c; c++) if (*c == '#' && c > v && (c[-1] == ' ' || c[-1] == '\t')) { *c = 0; break; }
+            trim(v);
+        }
+        if (!strcmp(k, "theme") || !strcmp(k, "wallpaper"))
+            for (char *c = v; *c; c++) *c = (char)tolower((unsigned char)*c);
         if (mode == CFG_STATE) {
             if (!strcmp(k, "user")) snprintf(g.user, sizeof g.user, "%s", v);
             else if (!strcmp(k, "session")) snprintf(g.last_sess, sizeof g.last_sess, "%s", v);
             else if (!strcmp(k, "theme")) {
-                if (set_theme(v)) {
-                    g.theme_override = true;
-                    g.theme_override_val = g.theme;
-                }
+                if (set_theme(v)) { g.theme_override = true; g.theme_override_val = g.theme; }
+            } else if (!strcmp(k, "wallpaper")) {
+                if (strcmp(v, "random") && set_wallpaper(v)) { g.wp_override = true; g.wp_override_val = g.wp; }
             } else if (!strcmp(k, "scale")) {
                 char *end;
                 long n = strtol(v, &end, 10);
                 if (end != v) g.scale = n < 60 ? 60 : n > 160 ? 160 : (int)n;
             }
-        } else if (!strcmp(k, "theme")) set_theme(v);
-        else if (!strcmp(k, "numlock")) g.numlock = !strcmp(v, "on") ? 1 : !strcmp(v, "off") ? 0 : -1;
+        } else if (!strcmp(k, "theme")) { if (!set_theme(v)) diag("unknown theme \"%s\"", v); }
+        else if (!strcmp(k, "wallpaper")) { if (!set_wallpaper(v)) diag("unknown wallpaper \"%s\" (festival ocean forest none random)", v); }
+        else if (!strcmp(k, "numlock")) g.numlock = !strcasecmp(v, "on") ? 1 : !strcasecmp(v, "off") ? 0 : -1;
         else if (mode == CFG_SYSTEM && !strcmp(k, "xserver")) snprintf(g.xserver, sizeof g.xserver, "%s", v);
         else if (mode == CFG_SYSTEM && !strcmp(k, "xinit")) snprintf(g.xinit, sizeof g.xinit, "%s", v);
-        else if (k[0] == 'f') {
+        else if (mode == CFG_SYSTEM && !strcmp(k, "font")) { snprintf(fnt.want, sizeof fnt.want, "%s", v); fnt.path[0] = 0; }
+        else if (mode == CFG_SYSTEM && !strcmp(k, "font_size")) {
+            char *end;
+            long n = strtol(v, &end, 10);
+            if (end != v) fnt.size = n < FONT_MIN ? FONT_MIN : n > FONT_MAX ? FONT_MAX : (int)n;
+            else diag("font_size needs a number");
+        } else if (k[0] == 'f' && isdigit((unsigned char)k[1])) {
             char *end;
             long n = strtol(k + 1, &end, 10);
-            if (end == k + 1 || n < 1 || n > NFKEY) continue;
+            if (n < 1 || n > NFKEY) { diag("no such key %s (F1-F%d)", k, NFKEY); continue; }
             FKey *fk = &g.fk[n - 1];
             if (!*end) {
-                if (is_builtin(v) || (mode == CFG_SYSTEM && !strncmp(v, "exec:", 5) && v[5]))
-                    snprintf(fk->act, sizeof fk->act, "%s", v);
+                const char *a = canon_action(v);
+                if (is_builtin(a) || (mode == CFG_SYSTEM && !strncmp(v, "exec:", 5) && v[5])) {
+                    snprintf(fk->act, sizeof fk->act, "%s", a);
+                    fk->src = mode == CFG_SYSTEM ? 1 : 2;
+                } else if (!strncmp(v, "exec:", 5)) diag("exec: is only allowed in /etc/lumdm.conf");
+                else diag("unknown action \"%s\"", v);
             } else if (!strcmp(end, "_label")) snprintf(fk->label, sizeof fk->label, "%s", v);
-        }
+            else diag("unknown key \"%s\"", k);
+        } else diag("unknown key \"%s\"%s", k, !strcmp(k, "font") || !strcmp(k, "font_size") || !strcmp(k, "xserver") || !strcmp(k, "xinit") ? " (system file only)" : "");
     }
 }
 static void load_kv(const char *path, int mode) {
     FILE *f = fopen(path, "r");
     if (!f) return;
-    parse_stream(f, mode);
+    parse_stream(f, mode, path);
     fclose(f);
 }
-// ~/.config/lumdm.conf of the typed user, read before login - so be paranoid:
-// no symlinks, regular file, owned by that user, small, not world-writable.
-static void load_user_conf(const char *user) {
-    struct passwd *pw = getpwnam(user);
-    if (!pw) return;
-    char p[PATH_MAX];
-    snprintf(p, sizeof p, "%s/.config/lumdm.conf", pw->pw_dir);
-    int fd = open(p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) return;
+// ~/.config/lumdm.conf of the typed user, read before login. A child drops to that user and reads the
+// file with their own permissions, so symlinked dotfiles (stow, chezmoi...) work and cannot be abused to
+// read other files as root. Only recognised keys are parsed; size is capped.
+enum { UC_OK, UC_NONE, UC_NOTREG, UC_BIG, UC_DENIED, UC_ERR };
+static const char *const UC_WHY[] = {"", "", "not a regular file", "larger than 4 KiB", "permission denied", "unreadable"};
+static int slurp(const char *path, int out) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? UC_NONE : errno == EACCES || errno == EPERM ? UC_DENIED : UC_ERR;
     struct stat st;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != pw->pw_uid || st.st_size > 4096 || (st.st_mode & S_IWOTH)) {
-        close(fd);
-        return;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return UC_NOTREG;
+    if (st.st_size > 4096) return UC_BIG;
+    char b[4097];
+    ssize_t n = read(fd, b, sizeof b);
+    if (n < 0) return UC_ERR;
+    if (n > 4096) return UC_BIG;
+    for (ssize_t o = 0; o < n;) {
+        ssize_t w = write(out, b + o, (size_t)(n - o));
+        if (w < 0) { if (errno == EINTR) continue; return UC_ERR; }
+        o += w;
     }
-    FILE *f = fdopen(fd, "r");
-    if (!f) { close(fd); return; }
-    parse_stream(f, CFG_USER);
-    fclose(f);
+    return UC_OK;
+}
+static int load_user_conf(const char *user) {
+    struct passwd *pw = getpwnam(user);
+    if (!pw) return UC_NONE;
+    char p[PATH_MAX], buf[4097];
+    snprintf(p, sizeof p, "%s/.config/lumdm.conf", pw->pw_dir);
+    int pf[2];
+    if (pipe2(pf, O_CLOEXEC)) return UC_ERR;
+    fflush(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) { close(pf[0]); close(pf[1]); return UC_ERR; }
+    if (pid == 0) {
+        close(pf[0]);
+        if (geteuid() == 0 && (initgroups(pw->pw_name, pw->pw_gid) || setgid(pw->pw_gid) || setuid(pw->pw_uid))) _exit(UC_ERR);
+        _exit(slurp(p, pf[1]));
+    }
+    close(pf[1]);
+    size_t len = 0;
+    ssize_t n;
+    while (len < sizeof buf - 1 && (n = read(pf[0], buf + len, sizeof buf - 1 - len)) != 0) {
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        len += (size_t)n;
+    }
+    close(pf[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : UC_ERR;
+    if (rc == UC_OK && len) {
+        FILE *f = fmemopen(buf, len, "r");
+        if (f) { parse_stream(f, CFG_USER, p); fclose(f); }
+    }
+    return rc;
 }
 // Re-layer: /etc/lumdm.conf < ~/.config/lumdm.conf of the selected user.
-// A theme chosen at runtime (or restored from state) wins over both.
+// A theme/wallpaper chosen at runtime (or restored from state) wins over both.
 static void refresh_user_conf(void) {
     if (!strcmp(g.user, g.cfg_user)) return;
     snprintf(g.cfg_user, sizeof g.cfg_user, "%s", g.user);
     g.theme = g.base.theme;
     g.numlock = g.base.numlock;
+    g.wp = g.base.wp;
     memcpy(g.fk, g.base.fk, sizeof g.fk);
-    if (g.user[0]) load_user_conf(g.user);
+    if (g.user[0]) {
+        int rc = load_user_conf(g.user);
+        if (rc >= UC_NOTREG) {
+            char m[160];
+            snprintf(m, sizeof m, "~/.config/lumdm.conf ignored: %s", UC_WHY[rc]);
+            set_msg(true, m);
+        }
+    }
     if (g.theme_override) g.theme = g.theme_override_val;
+    if (g.wp_override) g.wp = g.wp_override_val;
     palette();
     apply_numlock();
 }
@@ -560,6 +666,7 @@ static void save_state(void) {
     if (!f) return;
     fprintf(f, "user=%s\nsession=%s\nscale=%d\n", g.user, g.s[g.sel].name, g.scale);
     if (g.theme_override) fprintf(f, "theme=%s\n", THEMES[g.theme_override_val].name);
+    if (g.wp_override) fprintf(f, "wallpaper=%s\n", WP_NAMES[g.wp_override_val]);
     fclose(f);
 }
 static void clean_exec(char *dst, const char *src) {
@@ -623,20 +730,34 @@ static void load_sessions(void) {
     snprintf(sh.name, sizeof sh.name, "Shell (tty)");
     g.s[g.ns++] = sh;
 }
+// Re-read the font after a config/zoom change; the window size follows.
+static void font_sync(void) {
+    if (!g.vt) return;
+    font_apply(g.scale);
+    get_size();
+    g.dirty = true;
+}
 // Re-read /etc/lumdm.conf and the selected user's overrides without dropping input.
 static void reload_config(void) {
-    char sel[NAME_LEN] = "";
+    char sel[NAME_LEN] = "", oldfont[CMD_LEN];
     if (g.ns > 0 && g.sel >= 0 && g.sel < g.ns) snprintf(sel, sizeof sel, "%s", g.s[g.sel].name);
+    snprintf(oldfont, sizeof oldfont, "%s", fnt.want);
+    int oldsize = fnt.size;
 
     memset(g.fk, 0, sizeof g.fk);
     g.theme = 0;
+    g.wp = WP_FESTIVAL;
     g.numlock = -1;
+    fnt.want[0] = 0;
+    fnt.size = 16;
     snprintf(g.xserver, sizeof g.xserver, "/usr/bin/X");
     snprintf(g.xinit, sizeof g.xinit, "/usr/bin/xinit");
     load_kv(CONF, CFG_SYSTEM);
     g.base.theme = g.theme;
     g.base.numlock = g.numlock;
+    g.base.wp = g.wp;
     memcpy(g.base.fk, g.fk, sizeof g.fk);
+    if (strcmp(oldfont, fnt.want) || oldsize != fnt.size) { font_restore(); fnt.path[0] = 0; }
 
     g.ns = 0;
     load_sessions();
@@ -646,7 +767,9 @@ static void reload_config(void) {
     refresh_user_conf();
     palette();
     apply_numlock();
-    set_msg(false, "configuration reloaded");
+    font_sync();
+    set_msg(false, fnt.err[0] ? fnt.err : "configuration reloaded");
+    g.err = fnt.err[0] != 0;
 }
 
 // ------------------------------------------------------------------- PAM ----
@@ -864,6 +987,8 @@ static void scale_step(int d) {
     if (v == g.scale) return;
     g.scale = v;
     save_state();
+    font_sync();
+    g.dirty = true;
     char m[32];
     snprintf(m, sizeof m, "ui scale %d%%", g.scale);
     set_msg(false, m);
@@ -872,6 +997,8 @@ static void scale_reset(void) {
     if (g.scale == 100) return;
     g.scale = 100;
     save_state();
+    font_sync();
+    g.dirty = true;
     set_msg(false, "ui scale 100%");
 }
 // Ask the init system to reload/restart/stop the lumdm service. Returns false when
@@ -902,7 +1029,6 @@ static void restart_self(void) {
     term_reset();
     if (g_argv && g_argv[0]) execv("/proc/self/exe", g_argv);
     if (g_argv && g_argv[0]) execv(g_argv[0], g_argv);
-    get_size();
     term_init();
     set_msg(true, "restart failed");
 }
@@ -914,6 +1040,12 @@ static void run_action(const char *a) {
         g.theme_override_val = g.theme;
         save_state();
         palette();
+    } else if (!strcmp(a, "wallpaper")) {
+        g.wp = (g.wp + 1) % NWP;
+        g.wp_override = true;
+        g.wp_override_val = g.wp;
+        g.dirty = true;
+        save_state();
     } else if (!strcmp(a, "showpw")) g.showpw = !g.showpw;
     else if (!strcmp(a, "reload")) reload_config();
     else if (!strcmp(a, "restart")) {
@@ -1008,8 +1140,82 @@ static void on_key(int k) {
 
 static void on_sig(int s) { if (s == SIGWINCH) winch_flag = 1; else quit_flag = 1; }
 
+// ./lumdm --check [user]: what will the login screen actually use, and why was a line ignored?
+static int do_check(const char *user) {
+    g.check = true;
+    FILE *f = fopen(CONF, "r");
+    printf("system   %s  %s\n", CONF, f ? "found" : "MISSING - built-in defaults only");
+    if (f) { fclose(f); load_kv(CONF, CFG_SYSTEM); }
+    g.base.theme = g.theme; g.base.wp = g.wp; g.base.numlock = g.numlock;
+    memcpy(g.base.fk, g.fk, sizeof g.fk);
+    if (user) {
+        struct passwd *pw = getpwnam(user);
+        if (!pw) printf("user     %s  (no such user)\n", user);
+        else {
+            printf("user     %s/.config/lumdm.conf\n", pw->pw_dir);
+            int rc = load_user_conf(user);
+            printf("  status: %s\n", rc == UC_OK ? "loaded" : rc == UC_NONE ? "not present" : UC_WHY[rc]);
+            if (rc >= UC_NOTREG) puts("  -> the login screen would show this and ignore the file");
+        }
+    } else puts("user     (pass a username to check their ~/.config/lumdm.conf)");
+    printf("\ntheme=%s  wallpaper=%s  numlock=%s\n", THEMES[g.theme].name, WP_NAMES[g.wp], g.numlock < 0 ? "keep" : g.numlock ? "on" : "off");
+    if (fnt.want[0]) {
+        static struct FontBlob b;
+        bool ok = font_load(fnt.want, "", fnt.size, 0, &b);
+        printf("font     \"%s\" size %d -> ", fnt.want, fnt.size);
+        if (ok) printf("%s (cell %dx%d)\n", b.path, b.cw, b.ch);
+        else printf("FAILED: %s\n", b.err);
+        puts("         (applies on the Linux console only, not in --preview or a terminal emulator)");
+    } else puts("font     (console default)");
+    puts("\nfunction keys, as the bottom bar shows them:");
+    for (int i = 0; i < NFKEY; i++) {
+        const FKey *k = &g.fk[i];
+        if (!fk_on(k)) { printf("  F%-2d (off)\n", i + 1); continue; }
+        printf("  F%-2d %-14s %-22s [%s]\n", i + 1, fk_label(k), k->act, k->src == 2 ? "user file" : k->src == 1 ? "system file" : "default");
+    }
+    int need = 1;
+    for (int i = 0; i < NFKEY; i++) if (fk_on(&g.fk[i])) need += fk_w(i, 0);
+    printf("\nbar needs %d columns for full labels (short labels are used on narrower screens)\n", need);
+    return 0;
+}
+static int u8dec(const char **p) {
+    const unsigned char *s = (const unsigned char *)*p;
+    int c = *s++, n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    if (n) c &= 0x3F >> n;
+    while (n-- > 0 && (*s & 0xC0) == 0x80) c = (c << 6) | (*s++ & 0x3F);
+    *p = (const char *)s;
+    return c;
+}
+// ./lumdm --font-test [name|path] [px]: rasterise a font and draw the console bitmaps as text.
+static int do_font_test(int argc, char **argv) {
+    load_kv(CONF, CFG_SYSTEM);
+    const char *want = argc > 2 ? argv[2] : fnt.want[0] ? fnt.want : "monospace";
+    int px = argc > 3 ? atoi(argv[3]) : fnt.size;
+    px = px < FONT_MIN ? FONT_MIN : px > FONT_MAX ? FONT_MAX : px;
+    static struct FontBlob b;
+    if (!font_load(want, "", px, 0, &b)) { fprintf(stderr, "lumdm: %s\n", b.err); return 1; }
+    printf("%s  cell %dx%d\n", b.path, b.cw, b.ch);
+    static const char *const lines[] = {"Welcome back", "Hello, World 0123", "user @#%&* ~", "\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae \xe2\x97\x86 \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 \xe2\x80\xb9\xe2\x80\xba \xe2\x96\x8c\xe2\x96\x91\xe2\x96\x92\xe2\x96\x93"};
+    int bpr = (b.cw + 7) / 8;
+    for (size_t li = 0; li < sizeof lines / sizeof *lines; li++) {
+        putchar('\n');
+        for (int y = 0; y < b.ch; y++) {
+            for (const char *t = lines[li]; *t;) {
+                int cp = u8dec(&t), slot = 0;
+                for (int i = 0; i < FONT_SLOTS; i++) if (b.cp[i] == cp) { slot = i; break; }
+                const unsigned char *row = b.bits + (size_t)slot * FONT_ROWS * bpr + (size_t)y * bpr;
+                for (int x = 0; x < b.cw; x++) fputs(row[x >> 3] & (0x80 >> (x & 7)) ? "\xe2\x96\x88" : " ", stdout);
+            }
+            putchar('\n');
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     g_argv = argv;
+    if (argc > 1 && !strcmp(argv[1], "--check")) return do_check(argc > 2 ? argv[2] : nullptr);
+    if (argc > 1 && !strcmp(argv[1], "--font-test")) return do_font_test(argc, argv);
     g.preview = argc > 1 && !strcmp(argv[1], "--preview");
     if (!g.preview && geteuid() != 0) { fputs("lumdm: must run as root (or use --preview)\n", stderr); return 1; }
     if (!isatty(0) || !isatty(1)) { fputs("lumdm: stdin/stdout must be a terminal\n", stderr); return 1; }
@@ -1024,9 +1230,11 @@ int main(int argc, char **argv) {
     load_kv(CONF, CFG_SYSTEM);
     g.base.theme = g.theme;
     g.base.numlock = g.numlock;
+    g.base.wp = g.wp;
     memcpy(g.base.fk, g.fk, sizeof g.fk);
     load_sessions();
     load_kv(STATE, CFG_STATE);
+    if (g.wp_override) g.wp = g.wp_override_val;
     for (int i = 0; i < g.ns; i++) if (!strcmp(g.s[i].name, g.last_sess)) g.sel = i;
     g.focus = g.user[0] ? 2 : 1;
     refresh_user_conf();
@@ -1041,12 +1249,14 @@ int main(int argc, char **argv) {
 
     get_size();
     term_init();
+    if (fnt.err[0]) set_msg(true, fnt.err);
     draw();
     while (!quit_flag) {
         int to = (60 - (int)(time(nullptr) % 60)) * 1000;   // wake once a minute for the clock
         struct pollfd p = {0, POLLIN, 0};
         int r = poll(&p, 1, to);
-        if (winch_flag) { winch_flag = 0; get_size(); }
+        if (winch_flag) { winch_flag = 0; get_size(); g.dirty = true; }
+        if (r == 0) g.dirty = true;                          // minute tick: clock, battery
         if (r > 0 && (p.revents & POLLIN)) {
             ssize_t n = read(0, ib, sizeof ib);
             in_n = n > 0 ? (int)n : 0;
@@ -1057,7 +1267,6 @@ int main(int argc, char **argv) {
             struct timespec ts = {0, 200 * 1000 * 1000};   // avoid a busy loop while recovering
             nanosleep(&ts, nullptr);
             if (!reopen_tty()) break;
-            get_size();
             term_init();
         }
         draw();
